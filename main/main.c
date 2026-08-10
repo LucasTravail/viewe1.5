@@ -427,10 +427,16 @@ static void lvgl_port_task(void *arg)
     void *buf1 = NULL;
     void *buf2 = NULL;
     ESP_LOGI(TAG, "从 PSRAM 分配单独的 LVGL 绘制缓冲区");
+    /* Two buffers (double buffering): while the SPI/QSPI DMA is still
+     * sending buf1's chunk to the panel, LVGL can render the next chunk
+     * into buf2 instead of blocking until the transfer finishes. With a
+     * single buffer, heavy redraws (like scrolling the app list) can show
+     * as horizontal tearing/glitch bands where a still-in-flight chunk
+     * gets overwritten mid-transfer. */
     buf1 = heap_caps_malloc(LCD_H_RES * 48 * sizeof(lv_color_t), MALLOC_CAP_DMA);
-    // buf2 = heap_caps_malloc(LCD_H_RES * 48 * sizeof(lv_color_t), MALLOC_CAP_DMA);
+    buf2 = heap_caps_malloc(LCD_H_RES * 48 * sizeof(lv_color_t), MALLOC_CAP_DMA);
     assert(buf1);
-    // assert(buf2);
+    assert(buf2);
     // 初始化LVGL缓存
     lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LCD_H_RES * 48);
 

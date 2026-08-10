@@ -1,0 +1,40 @@
+{
+    "C_Cpp.intelliSenseEngine": "default",
+    "idf.espIdfPathWin": "D:/Espressif/frameworks/esp-idf-v5.3.2/",
+    "idf.pythonInstallPath": "D:\\Espressif\\tools\\idf-python\\3.11.2\\python.exe",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.portWin": "COM3",
+    "idf.toolsPathWin": "D:\\Espressif",
+    "idf.customExtraVars": {
+        "OPENOCD_SCRIPTS": "D:\\Espressif\\tools\\openocd-esp32\\v0.12.0-esp32-20240318/openocd-esp32/share/openocd/scripts",
+        "IDF_CCACHE_ENABLE": "1",
+        "ESP_ROM_ELF_DIR": "D:\\Espressif\\tools\\esp-rom-elfs\\20240305/",
+        "IDF_TARGET": "esp32s3"
+    },
+    "files.associations": {
+        "esp_lcd_panel_io.h": "c",
+        "esp_lcd_panel_vendor.h": "c",
+        "esp_lcd_co5300.h": "c",
+        "esp_lcd_io_spi.h": "c",
+        "spi_master.h": "c",
+        "esp_lcd_panel_io_interface.h": "c",
+        "freertos.h": "c",
+        "esp_check.h": "c",
+        "esp_lcd_panel_interface.h": "c",
+        "task.h": "c",
+        "semphr.h": "c",
+        "lv_port_indev_template.h": "c",
+        "gpio_filter.h": "c",
+        "qmi8658.h": "c",
+        "array": "c",
+        "string": "c",
+        "string_view": "c",
+        "span": "c",
+        "esp_log.h": "c",
+        "esp_lcd_touch.h": "c"
+    },
+    "idf.flashType": "UART",
+    "idf.currentSetup": "C:\\esp\\v5.5.5\\esp-idf"
+}

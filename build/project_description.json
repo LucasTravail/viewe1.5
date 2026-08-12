@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "viewe1.5",
-    "project_version":    "1",
+    "project_version":    "f3d73e5-dirty",
     "project_path":       "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5",
     "idf_path":           "C:/esp/v5.5.5/esp-idf",
     "build_dir":          "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/build",
@@ -1315,7 +1315,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/build/esp-idf/main/libmain.a",
-            "sources": [ "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/main/main.c", "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/main/lvgl_demo_ui.c" ],
+            "sources": [ "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/main/calc_engine.c", "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/main/main.c", "C:/Users/lucas/Desktop/ESP/ESP32-S3-Round-Dev-Board-main/examples/esp-idf/ESP32-S3-Round-Dev-Board/viewe1.5/main/lvgl_demo_ui.c" ],
             "include_dirs": [ "." ]
         },
         "mbedtls": {

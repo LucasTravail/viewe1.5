@@ -1,5 +1,7 @@
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
+#include "calc_engine.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "lvgl.h"
@@ -13,36 +15,51 @@
 
 #define BATT_CHARGE_TIME_MS 1500 /* how long the 0 -> x% charge-up animation takes */
 
-#define APP_GRID_COLS 3   /* "L" - icons per row */
-#define APP_ICON_COUNT 15 /* up to 15 apps, i.e. 5 floors of 3 */
-#define APP_ICON_SIZE 96
-#define APP_ICON_GAP 22
-/* Matches the panel's full vertical resolution (LCD_V_RES in main.c) so the
- * scrollable list's own clip boundary sits exactly on the screen edge -
- * already hidden by the round bezel - instead of an artificial inner
- * rectangle that would show up as a visible "square" while scrolling. */
-#define APP_GRID_VIEWPORT_H 466
-#define APP_ROW_PAD ((APP_GRID_VIEWPORT_H - (2 * APP_ICON_SIZE + APP_ICON_GAP)) / 2)
+#define APP_ICON_COUNT 15 /* up to 15 apps in the carousel */
 
-#define ELEVATOR_DIAM 452        /* hugs the round bezel */
-#define ELEVATOR_ARC_SPAN 45     /* total track sweep, in degrees, centered on 3 o'clock */
-#define ELEVATOR_HALF_SPAN (ELEVATOR_ARC_SPAN / 2)
-#define ELEVATOR_TRACK_START (360 - ELEVATOR_HALF_SPAN)          /* raw bg angle, e.g. 338 */
-#define ELEVATOR_TRACK_SPAN (2 * ELEVATOR_HALF_SPAN)              /* unwrapped span, e.g. 44 */
-#define ELEVATOR_CURSOR_SPAN 8   /* angular width of the moving cursor within the track */
-#define ELEVATOR_TRACK_W 6       /* stroke width of the dim background track */
-#define ELEVATOR_CURSOR_W 12     /* stroke width of the bright moving cursor */
+/* App launcher: a horizontal, one-at-a-time carousel (native LVGL scroll
+ * snap) instead of a scrolling grid - the current app sits centered and
+ * full-size, its neighbours peek in from both edges (dimmed/shrunk, see
+ * apps_carousel_refresh_peek), and a swipe left/right moves to the next
+ * one. Tapping any card - centered or still peeking - opens it directly. */
+#define CAROUSEL_RING_DIAM 148     /* the coloured ring around each app's icon */
+#define CAROUSEL_RING_W 6          /* ring stroke width */
+#define CAROUSEL_CARD_W 220        /* each card's own width */
+#define CAROUSEL_CARD_GAP 40       /* gap between cards - this is what makes neighbours "peek" */
+#define CAROUSEL_SLOT_W (CAROUSEL_CARD_W + CAROUSEL_CARD_GAP)
+/* Matches the panel's full horizontal resolution (LCD_H_RES in main.c):
+ * centers the 1st/last card the same way APP_ROW_PAD used to for the old
+ * vertical grid, just along X instead of Y. */
+#define CAROUSEL_VIEWPORT_W 471
+#define CAROUSEL_SIDE_PAD ((CAROUSEL_VIEWPORT_W - CAROUSEL_CARD_W) / 2)
+#define CAROUSEL_PEEK_OPA 90  /* opacity a fully-peeking neighbour is dimmed down to (out of 255) */
+#define CAROUSEL_PEEK_ZOOM 195 /* zoom a fully-peeking neighbour is shrunk down to (256 = 100%) */
 
 #define ROUND_STEP_CMM 1            /* value change per encoder detent or drag threshold crossed: 0.01mm */
 #define USINAGE_DRAG_PX_PER_STEP 8  /* px of vertical drag needed to move the value by ROUND_STEP_CMM */
 
 #define TARGET_MARKER_TICK_SPAN 6 /* degrees wide, the green "finish line" tick on the gauge ring */
 
+/* --- Calculatrice de cotes layout --- */
+#define CALC_OP_BTN_SIZE 66
+#define CALC_OP_BTN_GAP 14
+#define CALC_MORE_BTN_SIZE 72
+#define CALC_MORE_BTN_GAP 14
+#define CALC_MORE_COLS 3
+#define CALC_KEY_BTN_SIZE 58
+#define CALC_KEY_BTN_GAP 10
+#define CALC_KEY_COLS 3
+#define CALC_KEYPAD_BUF_LEN 24
+#define CALC_CAPTURE_FLASH_MS 350 /* how long the CAPTURE confirmation flash lasts */
+#define CALC_LIVE_ROUND CALC_ROUND_0_01 /* live reading always shown to 2 decimals, like the gauge */
+
 static const char *USINAGE_TAG = "usinage"; /* phase-transition logging, see idf.py monitor */
+static const char *CALC_TAG = "calc";
 
 static lv_obj_t *scr_gauge;   /* mm wave screen (default) */
 static lv_obj_t *scr_battery; /* battery screen, reached by swiping right */
 static lv_obj_t *scr_apps;    /* app launcher screen, reached by swiping left */
+static lv_obj_t *scr_calc;    /* Calculatrice de cotes, opened from the app grid */
 
 static lv_obj_t *arc;
 static lv_obj_t *percent_label;
@@ -54,7 +71,7 @@ static lv_obj_t *target_marker_arc; /* green tick on the ring: where the target 
 static lv_obj_t *batt_arc;
 static lv_obj_t *batt_label;
 
-static lv_obj_t *elevator_arc; /* curved scroll indicator on the apps screen */
+static lv_obj_t *apps_carousel; /* the app-launcher's horizontal scroll-snap row */
 
 /* Usinage app state. "Usinage" doesn't get its own screen - it just puts the
  * mm gauge into a caliper-style workflow, driven entirely by the main
@@ -93,6 +110,31 @@ static int32_t confirmed_value_cmm = 0;     /* target, locked in once USINAGE_PH
 static int32_t confirmed_tolerance_cmm = 0; /* +/- tolerance, locked in once USINAGE_PHASE_TOLERANCE is confirmed */
 static int32_t usinage_drag_accum_px = 0;   /* sub-threshold vertical drag not yet turned into a step */
 
+/* --- Calculatrice de cotes ---
+ * The whole point: the live measurement (the same shared reading the gauge
+ * screen animates - see current_cmm) can be dropped into a running
+ * calculation with one long-press, mixed freely with manually-typed
+ * numbers and with its own history. All the actual arithmetic lives in
+ * calc_engine (calc_state below); this screen only ever displays that
+ * state and forwards taps into it - see section 22 of the spec this was
+ * built from. */
+static lv_obj_t *calc_live_value_label; /* top of screen: continuously-updated live reading */
+static lv_obj_t *calc_expr_label;       /* small caption: "CAPTURE", or "25.05 +" while an op is pending */
+static lv_obj_t *calc_result_label;     /* the big number: current working value, or an error message */
+
+static lv_obj_t *calc_round_overlay; /* ARRONDI: pick a display precision */
+static lv_obj_t *calc_more_overlay;  /* "..." : ABS, +/-, C, mm/in, history, memory */
+static lv_obj_t *calc_unit_btn_label;
+
+static lv_obj_t *calc_keypad_overlay; /* manual numeric entry */
+static lv_obj_t *calc_keypad_preview_label;
+static char calc_keypad_buf[CALC_KEYPAD_BUF_LEN] = "";
+
+static lv_obj_t *calc_history_overlay;
+static lv_obj_t *calc_history_list; /* rebuilt each time the overlay opens */
+
+static calc_state_t calc_state;
+
 lv_obj_t *btn = NULL;
 
 void btn_cb(lv_event_t *e)
@@ -107,22 +149,43 @@ static void app_icon_cb(lv_event_t *e)
     (void)e;
 }
 
-/* Keeps the curved cursor in sync with how far the app list is scrolled:
- * scroll_top + scroll_bottom is the total scrollable distance regardless of
- * the current position, so their ratio gives a stable 0-100% position.
- * The cursor's start/end angles are set directly (not via lv_arc_set_value)
- * so it stays a fixed-width curved segment sliding along the track, rather
- * than a pie-slice that grows from one end. */
-static void app_grid_scroll_cb(lv_event_t *e)
+/* Dims and shrinks every card by how far it currently sits from the
+ * carousel's own center - the centered card stays at full size/opacity,
+ * and anything peeking in from the sides fades/shrinks smoothly the
+ * further out it is. Re-run on every scroll tick, so the effect tracks
+ * the finger in real time instead of snapping at the end. */
+static void apps_carousel_refresh_peek(lv_obj_t *cont)
 {
-    lv_obj_t *grid = lv_event_get_target(e);
-    lv_coord_t scrolled = lv_obj_get_scroll_top(grid);
-    lv_coord_t total = scrolled + lv_obj_get_scroll_bottom(grid);
-    int32_t pct = (total > 0) ? (int32_t)(((int64_t)scrolled * 100) / total) : 0;
+    lv_area_t cont_area;
+    lv_obj_get_coords(cont, &cont_area);
+    lv_coord_t cont_center_x = (cont_area.x1 + cont_area.x2) / 2;
 
-    int32_t travel = ELEVATOR_TRACK_SPAN - ELEVATOR_CURSOR_SPAN;
-    int32_t cursor_start = ELEVATOR_TRACK_START + (pct * travel) / 100;
-    lv_arc_set_angles(elevator_arc, cursor_start, cursor_start + ELEVATOR_CURSOR_SPAN);
+    uint32_t n = lv_obj_get_child_cnt(cont);
+    for (uint32_t i = 0; i < n; i++)
+    {
+        lv_obj_t *card = lv_obj_get_child(cont, i);
+        lv_area_t card_area;
+        lv_obj_get_coords(card, &card_area);
+        lv_coord_t card_center_x = (card_area.x1 + card_area.x2) / 2;
+
+        /* 0 = dead center, 1 = a full slot-pitch away (fully "peeking") */
+        float t = (float)abs((int)(card_center_x - cont_center_x)) / (float)CAROUSEL_SLOT_W;
+        if (t > 1.0f)
+        {
+            t = 1.0f;
+        }
+
+        lv_opa_t opa = (lv_opa_t)(255 - t * (255 - CAROUSEL_PEEK_OPA));
+        lv_coord_t zoom = (lv_coord_t)(256 - t * (256 - CAROUSEL_PEEK_ZOOM));
+
+        lv_obj_set_style_opa(card, opa, 0);
+        lv_obj_set_style_transform_zoom(card, zoom, 0);
+    }
+}
+
+static void apps_carousel_scroll_cb(lv_event_t *e)
+{
+    apps_carousel_refresh_peek(lv_event_get_target(e));
 }
 
 /* Shared by the live wave, the measurement rounding and the tolerance step:
@@ -177,12 +240,15 @@ static void usinage_place_target_marker(int32_t target_cmm)
  * perfectly smooth, continuously-differentiable 0->150->0->-150->0 wave
  * (no velocity discontinuity at the turning points, unlike a piecewise
  * linear ramp). Stands in for a live caliper reading until it's captured. */
+static void calc_refresh_live_label(void); /* defined below, in the Calculatrice de cotes section */
+
 static void set_arc_value(void *obj, int32_t t)
 {
     (void)obj;
     float angle_rad = (2.0f * (float)M_PI) * ((float)t / CYCLE_UNITS);
     current_cmm = (int32_t)lroundf(MM_PEAK_CMM * sinf(angle_rad));
     apply_mm_display(current_cmm);
+    calc_refresh_live_label(); /* shared "sensor": keep the calculator's LIVE reading current too */
 }
 
 static void start_wave_anim(void)
@@ -470,6 +536,382 @@ static void usinage_icon_cb(lv_event_t *e)
     lv_scr_load_anim(scr_gauge, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
 }
 
+/* Keeps the top-of-screen LIVE reading current. Called from set_arc_value
+ * on every animation tick (the same shared "sensor" the gauge/Usinage
+ * read), regardless of which screen is actually visible - cheap, and it
+ * means the value is never stale by the time the operator switches to the
+ * calculator. Guarded because it can run before the calculator screen's
+ * widgets exist yet (the wave starts animating before scr_calc is built). */
+static void calc_refresh_live_label(void)
+{
+    if (calc_live_value_label == NULL)
+    {
+        return;
+    }
+    char buf[32];
+    calc_format_value(current_cmm / 100.0, calc_state.unit, CALC_LIVE_ROUND, buf, sizeof(buf));
+    lv_label_set_text(calc_live_value_label, buf);
+}
+
+static const char *calc_error_message(calc_err_t err)
+{
+    switch (err)
+    {
+    case CALC_ERR_DIV_ZERO:
+        return "Division impossible";
+    case CALC_ERR_OVERFLOW:
+        return "Depassement";
+    case CALC_ERR_NO_VALUE:
+        return "Aucune valeur";
+    case CALC_ERR_NO_MEASURE:
+        return "Mesure indisponible";
+    default:
+        return "";
+    }
+}
+
+/* Redraws the expression caption + big result from calc_state. Called
+ * after every button press that can change it - CAPTURE, an operator, a
+ * unary op, clear, a keypad/history entry. Never touches the LIVE label
+ * (see calc_refresh_live_label) - LIVE and the working value must never
+ * be conflated (spec section 16). */
+static void calc_refresh_ui(void)
+{
+    if (calc_state.error != CALC_ERR_NONE)
+    {
+        lv_obj_set_style_text_color(calc_result_label, lv_palette_main(LV_PALETTE_RED), 0);
+        lv_label_set_text(calc_result_label, calc_error_message(calc_state.error));
+        lv_label_set_text(calc_expr_label, "");
+        return;
+    }
+
+    lv_obj_set_style_text_color(calc_result_label, lv_color_white(), 0);
+
+    if (!calc_state.has_value)
+    {
+        lv_label_set_text(calc_result_label, "--");
+        lv_label_set_text(calc_expr_label, "");
+        return;
+    }
+
+    char buf[32];
+    calc_format_value(calc_state.value, calc_state.unit, calc_state.display_round, buf, sizeof(buf));
+    lv_label_set_text(calc_result_label, buf);
+
+    if (calc_state.pending_op != CALC_OP_NONE)
+    {
+        lv_label_set_text_fmt(calc_expr_label, "%s %s ...", buf, calc_op_symbol(calc_state.pending_op));
+    }
+    else
+    {
+        lv_label_set_text(calc_expr_label, "CAPTURE");
+    }
+}
+
+static void calc_flash_revert_cb(lv_timer_t *t)
+{
+    (void)t;
+    lv_obj_set_style_text_color(calc_expr_label, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+}
+
+/* Brief green flash on the caption line to confirm a capture landed,
+ * without slowing anything down (spec section 17: no long animation, no
+ * confirmation dialog - just visual feedback that resolves itself). */
+static void calc_flash_capture(void)
+{
+    lv_obj_set_style_text_color(calc_expr_label, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_timer_t *t = lv_timer_create(calc_flash_revert_cb, CALC_CAPTURE_FLASH_MS, NULL);
+    lv_timer_set_repeat_count(t, 1);
+}
+
+/* The physical CAPTURE button, for now: a long touch-press anywhere on the
+ * calculator screen (same mechanism as Usinage's main button, bound to its
+ * own screen - see the comment on scr_gauge's LONG_PRESSED handler). Grabs
+ * whatever current_cmm holds *at this instant*: the live wave itself is
+ * never touched, so nothing about a capture can retroactively change once
+ * it's in the calculation (spec section 16). */
+static void calc_capture_cb(lv_event_t *e)
+{
+    (void)e;
+    double mm = current_cmm / 100.0;
+    ESP_LOGI(CALC_TAG, "CAPTURE %.3f mm", mm);
+    calc_feed_value(&calc_state, mm);
+    calc_flash_capture();
+    calc_refresh_ui();
+}
+
+static void calc_op_btn_cb(lv_event_t *e)
+{
+    calc_op_t op = (calc_op_t)(intptr_t)lv_event_get_user_data(e);
+    calc_set_op(&calc_state, op);
+    calc_refresh_ui();
+}
+
+typedef enum
+{
+    CALC_QUICK_HALF,
+    CALC_QUICK_DOUBLE,
+} calc_quick_id_t;
+
+/* /2 and x2 live directly on the main screen (not tucked in the "more"
+ * menu) because they're explicitly the two most useful shortcuts in
+ * mechanical work (spec section 6). */
+static void calc_quick_unary_cb(lv_event_t *e)
+{
+    calc_quick_id_t id = (calc_quick_id_t)(intptr_t)lv_event_get_user_data(e);
+    if (id == CALC_QUICK_HALF)
+    {
+        calc_apply_half(&calc_state);
+    }
+    else
+    {
+        calc_apply_double(&calc_state);
+    }
+    calc_refresh_ui();
+}
+
+static void calc_round_choice_cb(lv_event_t *e)
+{
+    calc_round_t r = (calc_round_t)(intptr_t)lv_event_get_user_data(e);
+    calc_state.display_round = r;
+    lv_obj_add_flag(calc_round_overlay, LV_OBJ_FLAG_HIDDEN);
+    calc_refresh_ui();
+}
+
+static void calc_round_open_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_clear_flag(calc_round_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void calc_round_close_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_add_flag(calc_round_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* --- manual numeric entry (spec section 9): only shown on demand, from
+ * the "more" menu, so the main screen stays keypad-free (section 21). --- */
+static void calc_keypad_refresh_preview(void)
+{
+    lv_label_set_text(calc_keypad_preview_label, (calc_keypad_buf[0] == '\0') ? "0" : calc_keypad_buf);
+}
+
+static void calc_keypad_key_cb(lv_event_t *e)
+{
+    char ch = (char)(intptr_t)lv_event_get_user_data(e);
+    size_t len = strlen(calc_keypad_buf);
+
+    if (ch == '\b')
+    {
+        if (len > 0)
+        {
+            calc_keypad_buf[len - 1] = '\0';
+        }
+    }
+    else if (ch == '.')
+    {
+        if (strchr(calc_keypad_buf, '.') == NULL && len < CALC_KEYPAD_BUF_LEN - 2)
+        {
+            if (len == 0)
+            {
+                calc_keypad_buf[0] = '0';
+                len = 1;
+            }
+            calc_keypad_buf[len] = '.';
+            calc_keypad_buf[len + 1] = '\0';
+        }
+    }
+    else if (len < (size_t)CALC_KEYPAD_BUF_LEN - 1)
+    {
+        calc_keypad_buf[len] = ch;
+        calc_keypad_buf[len + 1] = '\0';
+    }
+
+    calc_keypad_refresh_preview();
+}
+
+static void calc_keypad_open_cb(lv_event_t *e)
+{
+    (void)e;
+    calc_keypad_buf[0] = '\0';
+    calc_keypad_refresh_preview();
+    lv_obj_add_flag(calc_more_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(calc_keypad_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void calc_keypad_ok_cb(lv_event_t *e)
+{
+    (void)e;
+    if (calc_keypad_buf[0] != '\0')
+    {
+        char *end = NULL;
+        double v = strtod(calc_keypad_buf, &end);
+        if (end != calc_keypad_buf) /* at least one character parsed as a number */
+        {
+            calc_feed_value(&calc_state, v);
+        }
+    }
+    lv_obj_add_flag(calc_keypad_overlay, LV_OBJ_FLAG_HIDDEN);
+    calc_refresh_ui();
+}
+
+static void calc_keypad_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_add_flag(calc_keypad_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* --- short history (spec section 11): tap an old result to reuse it --- */
+static void calc_history_row_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    const calc_history_entry_t *entry = calc_history_get(&calc_state, idx);
+    if (entry != NULL)
+    {
+        calc_feed_value(&calc_state, entry->result);
+    }
+    lv_obj_add_flag(calc_history_overlay, LV_OBJ_FLAG_HIDDEN);
+    calc_refresh_ui();
+}
+
+static void calc_history_rebuild(void)
+{
+    lv_obj_clean(calc_history_list); /* drops every row widget from the last time this was open */
+
+    if (calc_state.history_count == 0)
+    {
+        lv_obj_t *empty = lv_label_create(calc_history_list);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+        lv_label_set_text(empty, "Historique vide");
+        return;
+    }
+
+    for (int i = 0; i < calc_state.history_count; i++)
+    {
+        const calc_history_entry_t *entry = calc_history_get(&calc_state, i);
+        char line[40];
+        calc_format_history_entry(entry, calc_state.unit, calc_state.display_round, line, sizeof(line));
+
+        lv_obj_t *row = lv_btn_create(calc_history_list);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, lv_palette_darken(LV_PALETTE_GREY, 3), 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_outline_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 10, 0);
+        lv_obj_add_event_cb(row, calc_history_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *row_label = lv_label_create(row);
+        lv_obj_set_style_text_font(row_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(row_label, lv_color_white(), 0);
+        lv_label_set_text(row_label, line);
+        lv_obj_center(row_label);
+    }
+}
+
+static void calc_history_open_cb(lv_event_t *e)
+{
+    (void)e;
+    calc_history_rebuild();
+    lv_obj_add_flag(calc_more_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(calc_history_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void calc_history_close_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_add_flag(calc_history_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* --- secondary "..." panel: ABS, +/-, C, mm/in, history, keypad, memory -
+ * kept off the main screen so it stays uncluttered (spec sections 12, 21). --- */
+typedef enum
+{
+    CALC_MORE_ABS,
+    CALC_MORE_NEGATE,
+    CALC_MORE_CLEAR,
+    CALC_MORE_UNIT,
+    CALC_MORE_HISTORY,
+    CALC_MORE_KEYPAD,
+    CALC_MORE_MPLUS,
+    CALC_MORE_MMINUS,
+    CALC_MORE_MRECALL,
+    CALC_MORE_CANCEL_OP,
+    CALC_MORE_CLOSE,
+} calc_more_id_t;
+
+static void calc_more_btn_cb(lv_event_t *e)
+{
+    calc_more_id_t id = (calc_more_id_t)(intptr_t)lv_event_get_user_data(e);
+
+    switch (id)
+    {
+    case CALC_MORE_ABS:
+        calc_apply_abs(&calc_state);
+        break;
+    case CALC_MORE_NEGATE:
+        calc_toggle_sign(&calc_state);
+        break;
+    case CALC_MORE_CLEAR:
+        calc_clear(&calc_state);
+        break;
+    case CALC_MORE_UNIT:
+        calc_state.unit = (calc_state.unit == CALC_UNIT_MM) ? CALC_UNIT_IN : CALC_UNIT_MM;
+        lv_label_set_text(calc_unit_btn_label, (calc_state.unit == CALC_UNIT_IN) ? "IN" : "MM");
+        break;
+    case CALC_MORE_HISTORY:
+        calc_history_open_cb(e);
+        return;
+    case CALC_MORE_KEYPAD:
+        calc_keypad_open_cb(e);
+        return;
+    case CALC_MORE_MPLUS:
+        calc_memory_add(&calc_state);
+        break;
+    case CALC_MORE_MMINUS:
+        calc_memory_sub(&calc_state);
+        break;
+    case CALC_MORE_MRECALL:
+        calc_memory_recall(&calc_state);
+        break;
+    case CALC_MORE_CANCEL_OP:
+        calc_cancel_op(&calc_state);
+        break;
+    case CALC_MORE_CLOSE:
+        lv_obj_add_flag(calc_more_overlay, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    calc_refresh_ui();
+}
+
+/* MR doubles as MC on a long-press - keeps the memory row to one button
+ * instead of two, without hiding the clear function anywhere obscure. */
+static void calc_mr_long_press_cb(lv_event_t *e)
+{
+    (void)e;
+    calc_memory_clear(&calc_state);
+    calc_refresh_ui();
+}
+
+static void calc_more_open_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_obj_clear_flag(calc_more_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Opens the Calculatrice de cotes: same reused pattern as Usinage - bring
+ * its screen to the front, no per-open state to reset (the calculation
+ * naturally survives navigating away and back, which is the whole point
+ * of section 10's "successive calculations"). */
+static void calc_icon_cb(lv_event_t *e)
+{
+    (void)e;
+    calc_refresh_ui();
+    lv_scr_load_anim(scr_calc, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+}
+
 static void set_batt_value(void *obj, int32_t pct)
 {
     (void)obj;
@@ -524,9 +966,17 @@ static void gesture_cb(lv_event_t *e)
     {
         lv_scr_load_anim(scr_apps, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
     }
-    else if (scr_cur == scr_apps && dir == LV_DIR_RIGHT)
+    else if (scr_cur == scr_apps && dir == LV_DIR_BOTTOM)
     {
+        /* Left/right on the apps screen is claimed by the carousel itself
+         * (browsing between apps) - swipe down to leave it instead. */
         lv_scr_load_anim(scr_gauge, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+    }
+    else if (scr_cur == scr_calc && dir == LV_DIR_LEFT)
+    {
+        /* Same "swipe left = back to the app grid" convention as scr_gauge;
+         * scr_calc is only ever reached by tapping its icon there. */
+        lv_scr_load_anim(scr_apps, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
     }
 }
 
@@ -660,88 +1110,500 @@ void lvgl_demo_ui(lv_disp_t *disp)
     lv_obj_center(batt_label);
     lv_label_set_text(batt_label, "0%");
 
-    /* --- app launcher screen: up to 15 placeholder circles, 3 per row,
-     * scrolling down through the "floors" like an elevator --- */
+    /* --- app launcher screen: a horizontal one-at-a-time carousel, up to
+     * 15 apps - see apps_carousel_refresh_peek for the peek/dim effect and
+     * the CAROUSEL_* defines for the geometry. --- */
     scr_apps = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_apps, lv_color_black(), 0);
     lv_obj_clear_flag(scr_apps, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(scr_apps, gesture_cb, LV_EVENT_GESTURE, NULL);
 
-    lv_obj_t *grid = lv_obj_create(scr_apps);
-    lv_obj_remove_style_all(grid); /* plain layout container, no border/bg of its own */
-    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
-    /* Width is exactly the icon content (no extra gutter) so lv_obj_center
-     * below puts the icons themselves on the true screen center - the
-     * elevator sits well clear of them anyway (it's a thin cursor near the
-     * bezel, not a full-width bar). */
-    lv_obj_set_size(grid, APP_GRID_COLS * APP_ICON_SIZE + (APP_GRID_COLS - 1) * APP_ICON_GAP, APP_GRID_VIEWPORT_H);
-    lv_obj_center(grid);
-    lv_obj_set_style_pad_row(grid, APP_ICON_GAP, 0);
-    lv_obj_set_style_pad_column(grid, APP_ICON_GAP, 0);
-    /* Blank margin before the 1st row and after the last one: at rest (not
-     * scrolled) this centers the first 2 rows / 6 icons in the viewport,
-     * and mirrors it at the far end once the last row is reached. */
-    lv_obj_set_style_pad_top(grid, APP_ROW_PAD, 0);
-    lv_obj_set_style_pad_bottom(grid, APP_ROW_PAD, 0);
-    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    apps_carousel = lv_obj_create(scr_apps);
+    lv_obj_remove_style_all(apps_carousel); /* plain layout container, no border/bg of its own */
+    lv_obj_set_size(apps_carousel, CAROUSEL_VIEWPORT_W, LV_SIZE_CONTENT);
+    lv_obj_center(apps_carousel);
+    /* Blank margin before the 1st card and after the last one, exactly the
+     * old vertical grid's APP_ROW_PAD trick rotated 90 deg: lets the 1st/
+     * last card center at rest too, same as every card in between. */
+    lv_obj_set_style_pad_left(apps_carousel, CAROUSEL_SIDE_PAD, 0);
+    lv_obj_set_style_pad_right(apps_carousel, CAROUSEL_SIDE_PAD, 0);
+    lv_obj_set_style_pad_column(apps_carousel, CAROUSEL_CARD_GAP, 0);
+    lv_obj_set_flex_flow(apps_carousel, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(apps_carousel, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    /* Only vertical scrolling, so a horizontal swipe still falls through to
-     * gesture_cb (switching screens) instead of being eaten as a scroll. */
-    lv_obj_set_scroll_dir(grid, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_OFF); /* replaced by elevator_arc below */
-    lv_obj_add_event_cb(grid, app_grid_scroll_cb, LV_EVENT_SCROLL, NULL);
+    /* Only horizontal scrolling, so a vertical swipe still falls through to
+     * gesture_cb (leaving the carousel) instead of being eaten as a scroll -
+     * same principle as every other screen here, just the axes swapped. */
+    lv_obj_set_scroll_dir(apps_carousel, LV_DIR_HOR);
+    lv_obj_set_scroll_snap_x(apps_carousel, LV_SCROLL_SNAP_CENTER);
+    lv_obj_set_scrollbar_mode(apps_carousel, LV_SCROLLBAR_MODE_OFF); /* the peek itself is the "there's more" cue */
+    lv_obj_add_event_cb(apps_carousel, apps_carousel_scroll_cb, LV_EVENT_SCROLL, NULL);
 
     for (int i = 0; i < APP_ICON_COUNT; i++)
     {
-        lv_obj_t *icon = lv_obj_create(grid);
-        lv_obj_set_size(icon, APP_ICON_SIZE, APP_ICON_SIZE);
-        lv_obj_set_style_radius(icon, LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(icon, lv_palette_main(LV_PALETTE_GREY), 0);
-        lv_obj_set_style_bg_color(icon, lv_palette_darken(LV_PALETTE_GREY, 2), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(icon, 0, 0);
-        lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *card = lv_obj_create(apps_carousel);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, CAROUSEL_CARD_W, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(card, LV_OPA_TRANSP, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_row(card, 12, 0);
+
+        const char *name;
+        const char *subtitle;
+        const char *icon_text;
+        const lv_font_t *icon_font;
+        lv_color_t ring_color;
+        lv_event_cb_t open_cb;
+        char placeholder_name[8];
 
         if (i == 0)
         {
             /* First app, wired up for real: Usinage. A gear stands in well
-             * for "machining" and is already in the bundled symbol font -
-             * no custom artwork needed. The rest stay grey placeholders
-             * until they get their own feature/icon. */
-            lv_obj_t *icon_glyph = lv_label_create(icon);
-            lv_obj_set_style_text_font(icon_glyph, &lv_font_montserrat_48, 0);
-            lv_obj_set_style_text_color(icon_glyph, lv_color_white(), 0);
-            lv_label_set_text(icon_glyph, LV_SYMBOL_SETTINGS);
-            lv_obj_center(icon_glyph);
-            lv_obj_add_event_cb(icon, usinage_icon_cb, LV_EVENT_CLICKED, NULL);
+             * for "machining" - already in the bundled symbol font, no
+             * custom artwork needed. */
+            name = "USINAGE";
+            subtitle = "Mesure";
+            icon_text = LV_SYMBOL_SETTINGS;
+            icon_font = &lv_font_montserrat_48;
+            ring_color = lv_palette_main(LV_PALETTE_ORANGE);
+            open_cb = usinage_icon_cb;
+        }
+        else if (i == 1)
+        {
+            /* 2nd app, wired up for real: Calculatrice de cotes. No
+             * built-in "calculator" glyph in the bundled symbol set, so
+             * "123" stands in for it. */
+            name = "CALCULATRICE";
+            subtitle = "De cotes";
+            icon_text = "123";
+            icon_font = &lv_font_montserrat_48;
+            ring_color = lv_palette_main(LV_PALETTE_BLUE);
+            open_cb = calc_icon_cb;
         }
         else
         {
-            lv_obj_add_event_cb(icon, app_icon_cb, LV_EVENT_CLICKED, NULL);
+            /* Placeholders: dim ring, no feature behind them yet. */
+            lv_snprintf(placeholder_name, sizeof(placeholder_name), "APP %d", i + 1);
+            name = placeholder_name;
+            subtitle = "A venir";
+            icon_text = "?";
+            icon_font = &lv_font_montserrat_22;
+            ring_color = lv_palette_darken(LV_PALETTE_GREY, 2);
+            open_cb = app_icon_cb;
+        }
+
+        lv_obj_t *ring = lv_obj_create(card);
+        lv_obj_set_size(ring, CAROUSEL_RING_DIAM, CAROUSEL_RING_DIAM);
+        lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(ring, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(ring, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(ring, CAROUSEL_RING_W, 0);
+        lv_obj_set_style_border_color(ring, ring_color, 0);
+        lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE); /* taps fall through to the card underneath */
+
+        lv_obj_t *icon_glyph = lv_label_create(ring);
+        lv_obj_set_style_text_font(icon_glyph, icon_font, 0);
+        lv_obj_set_style_text_color(icon_glyph, i < 2 ? lv_color_white() : lv_palette_lighten(LV_PALETTE_GREY, 1), 0);
+        lv_label_set_text(icon_glyph, icon_text);
+        lv_obj_center(icon_glyph);
+        lv_obj_clear_flag(icon_glyph, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *name_label = lv_label_create(card);
+        lv_obj_set_style_text_font(name_label, &lv_font_montserrat_22, 0);
+        lv_obj_set_style_text_color(name_label, lv_color_white(), 0);
+        lv_label_set_text(name_label, name);
+        lv_obj_clear_flag(name_label, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *sub_label = lv_label_create(card);
+        lv_obj_set_style_text_font(sub_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(sub_label, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+        lv_label_set_text(sub_label, subtitle);
+        lv_obj_clear_flag(sub_label, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_add_event_cb(card, open_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    apps_carousel_refresh_peek(apps_carousel); /* set the correct dim/zoom before the first scroll ever happens */
+
+    /* --- Calculatrice de cotes --- */
+    calc_init(&calc_state);
+
+    scr_calc = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_calc, lv_color_black(), 0);
+    lv_obj_clear_flag(scr_calc, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(scr_calc, gesture_cb, LV_EVENT_GESTURE, NULL);
+    lv_obj_add_event_cb(scr_calc, calc_capture_cb, LV_EVENT_LONG_PRESSED, NULL);
+
+    /* LIVE: always the current shared reading, never touched by anything
+     * below it - visually small/cyan on purpose, so it can never be
+     * mistaken for the (much bigger, white) working value (spec 16). */
+    calc_live_value_label = lv_label_create(scr_calc);
+    lv_obj_set_style_text_font(calc_live_value_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(calc_live_value_label, lv_palette_main(LV_PALETTE_CYAN), 0);
+    lv_label_set_text(calc_live_value_label, "LIVE --");
+    lv_obj_align(calc_live_value_label, LV_ALIGN_CENTER, 0, -190);
+    lv_obj_clear_flag(calc_live_value_label, LV_OBJ_FLAG_CLICKABLE);
+
+    calc_expr_label = lv_label_create(scr_calc);
+    lv_obj_set_style_text_font(calc_expr_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(calc_expr_label, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    lv_label_set_text(calc_expr_label, "");
+    lv_obj_align(calc_expr_label, LV_ALIGN_CENTER, 0, -160);
+    lv_obj_clear_flag(calc_expr_label, LV_OBJ_FLAG_CLICKABLE);
+
+    /* The working value/result: the main visual focus of the screen. */
+    calc_result_label = lv_label_create(scr_calc);
+    lv_obj_set_style_text_font(calc_result_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(calc_result_label, lv_color_white(), 0);
+    lv_label_set_text(calc_result_label, "--");
+    lv_obj_align(calc_result_label, LV_ALIGN_CENTER, 0, -95);
+    lv_obj_clear_flag(calc_result_label, LV_OBJ_FLAG_CLICKABLE);
+
+    /* Operator row: +, -, x, /. Single glyphs -> circles, like every other
+     * one-glyph button in this app (confirm/cancel, app icons). */
+    {
+        const char *op_labels[4] = {"+", "-", "x", "/"};
+        const calc_op_t ops[4] = {CALC_OP_ADD, CALC_OP_SUB, CALC_OP_MUL, CALC_OP_DIV};
+        int total_w = 4 * CALC_OP_BTN_SIZE + 3 * CALC_OP_BTN_GAP;
+        int start_x = -total_w / 2 + CALC_OP_BTN_SIZE / 2;
+
+        for (int i = 0; i < 4; i++)
+        {
+            lv_obj_t *btn_op = lv_btn_create(scr_calc);
+            lv_obj_set_size(btn_op, CALC_OP_BTN_SIZE, CALC_OP_BTN_SIZE);
+            lv_obj_set_style_radius(btn_op, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(btn_op, lv_palette_darken(LV_PALETTE_GREY, 3), 0);
+            lv_obj_set_style_shadow_width(btn_op, 0, 0);
+            lv_obj_set_style_outline_width(btn_op, 0, 0);
+            lv_obj_align(btn_op, LV_ALIGN_CENTER, start_x + i * (CALC_OP_BTN_SIZE + CALC_OP_BTN_GAP), 10);
+            lv_obj_add_event_cb(btn_op, calc_op_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)ops[i]);
+
+            lv_obj_t *op_glyph = lv_label_create(btn_op);
+            lv_obj_set_style_text_font(op_glyph, &lv_font_montserrat_48, 0);
+            lv_obj_set_style_text_color(op_glyph, lv_color_white(), 0);
+            lv_label_set_text(op_glyph, op_labels[i]);
+            lv_obj_center(op_glyph);
         }
     }
 
-    /* Curved "elevator" scroll indicator: a dim 45 deg track hugging the
-     * right edge of the round screen, with a short bright segment (the
-     * cursor) sliding along it. Both are real arc strokes - genuinely bent
-     * along the bezel's curvature, not a straight rectangle - and there's
-     * no knob at all here; app_grid_scroll_cb drives the cursor's angles
-     * directly via lv_arc_set_angles(). */
-    elevator_arc = lv_arc_create(scr_apps);
-    lv_obj_set_size(elevator_arc, ELEVATOR_DIAM, ELEVATOR_DIAM);
-    lv_obj_center(elevator_arc);
-    lv_arc_set_rotation(elevator_arc, 0);
-    lv_arc_set_bg_angles(elevator_arc, ELEVATOR_TRACK_START, ELEVATOR_HALF_SPAN);
-    lv_obj_remove_style(elevator_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(elevator_arc, LV_OBJ_FLAG_CLICKABLE); /* display only, not draggable */
+    /* Quick row: /2 and x2 (spec 6: must be especially accessible), ARR
+     * (rounding) and "..." for everything secondary (spec 12/21: keep the
+     * main screen uncluttered). Text labels -> rounded squares, easier to
+     * fit multi-character text in than a circle. */
+    {
+        const char *quick_labels[4] = {"/2", "x2", "ARR", "..."};
+        lv_color_t quick_colors[4] = {
+            lv_palette_main(LV_PALETTE_BLUE),
+            lv_palette_main(LV_PALETTE_BLUE),
+            lv_palette_main(LV_PALETTE_ORANGE),
+            lv_palette_darken(LV_PALETTE_GREY, 3),
+        };
+        int total_w = 4 * CALC_OP_BTN_SIZE + 3 * CALC_OP_BTN_GAP;
+        int start_x = -total_w / 2 + CALC_OP_BTN_SIZE / 2;
 
-    lv_obj_set_style_arc_color(elevator_arc, lv_palette_darken(LV_PALETTE_GREY, 3), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(elevator_arc, ELEVATOR_TRACK_W, LV_PART_MAIN);
-    lv_obj_set_style_arc_rounded(elevator_arc, true, LV_PART_MAIN);
+        for (int i = 0; i < 4; i++)
+        {
+            lv_obj_t *btn_q = lv_btn_create(scr_calc);
+            lv_obj_set_size(btn_q, CALC_OP_BTN_SIZE, CALC_OP_BTN_SIZE);
+            lv_obj_set_style_radius(btn_q, 16, 0);
+            lv_obj_set_style_bg_color(btn_q, quick_colors[i], 0);
+            lv_obj_set_style_shadow_width(btn_q, 0, 0);
+            lv_obj_set_style_outline_width(btn_q, 0, 0);
+            lv_obj_align(btn_q, LV_ALIGN_CENTER, start_x + i * (CALC_OP_BTN_SIZE + CALC_OP_BTN_GAP), 95);
 
-    lv_obj_set_style_arc_color(elevator_arc, lv_palette_main(LV_PALETTE_BLUE), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(elevator_arc, ELEVATOR_CURSOR_W, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_rounded(elevator_arc, true, LV_PART_INDICATOR);
-    /* Start at rest (scroll = 0%): cursor sits at the near end of the track. */
-    lv_arc_set_angles(elevator_arc, ELEVATOR_TRACK_START, ELEVATOR_TRACK_START + ELEVATOR_CURSOR_SPAN);
+            lv_obj_t *q_label = lv_label_create(btn_q);
+            lv_obj_set_style_text_font(q_label, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(q_label, lv_color_white(), 0);
+            lv_label_set_text(q_label, quick_labels[i]);
+            lv_obj_center(q_label);
+
+            if (i == 0)
+            {
+                lv_obj_add_event_cb(btn_q, calc_quick_unary_cb, LV_EVENT_CLICKED, (void *)(intptr_t)CALC_QUICK_HALF);
+            }
+            else if (i == 1)
+            {
+                lv_obj_add_event_cb(btn_q, calc_quick_unary_cb, LV_EVENT_CLICKED, (void *)(intptr_t)CALC_QUICK_DOUBLE);
+            }
+            else if (i == 2)
+            {
+                lv_obj_add_event_cb(btn_q, calc_round_open_cb, LV_EVENT_CLICKED, NULL);
+            }
+            else
+            {
+                lv_obj_add_event_cb(btn_q, calc_more_open_cb, LV_EVENT_CLICKED, NULL);
+            }
+        }
+    }
+
+    /* --- ARRONDI overlay: pick a display precision (spec 7). Rounding is
+     * display-only - calc_state.value itself is never touched, so it
+     * never has to be "undone" and chained calculations stay exact. --- */
+    calc_round_overlay = lv_obj_create(scr_calc);
+    lv_obj_remove_style_all(calc_round_overlay);
+    lv_obj_set_size(calc_round_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_center(calc_round_overlay);
+    lv_obj_set_style_bg_color(calc_round_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(calc_round_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(calc_round_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(calc_round_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *round_title = lv_label_create(calc_round_overlay);
+    lv_obj_set_style_text_font(round_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(round_title, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    lv_label_set_text(round_title, "ARRONDI");
+    lv_obj_align(round_title, LV_ALIGN_CENTER, 0, -140);
+
+    {
+        const char *round_labels[4] = {"INT", "0.1", "0.01", "0.001"};
+        const calc_round_t round_vals[4] = {CALC_ROUND_INT, CALC_ROUND_0_1, CALC_ROUND_0_01, CALC_ROUND_0_001};
+        int size = 74, gap = 12;
+        int total_w = 4 * size + 3 * gap;
+        int start_x = -total_w / 2 + size / 2;
+
+        for (int i = 0; i < 4; i++)
+        {
+            lv_obj_t *btn_r = lv_btn_create(calc_round_overlay);
+            lv_obj_set_size(btn_r, size, size);
+            lv_obj_set_style_radius(btn_r, 16, 0);
+            lv_obj_set_style_bg_color(btn_r, lv_palette_darken(LV_PALETTE_GREY, 3), 0);
+            lv_obj_set_style_shadow_width(btn_r, 0, 0);
+            lv_obj_set_style_outline_width(btn_r, 0, 0);
+            lv_obj_align(btn_r, LV_ALIGN_CENTER, start_x + i * (size + gap), 0);
+            lv_obj_add_event_cb(btn_r, calc_round_choice_cb, LV_EVENT_CLICKED, (void *)(intptr_t)round_vals[i]);
+
+            lv_obj_t *r_label = lv_label_create(btn_r);
+            lv_obj_set_style_text_font(r_label, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(r_label, lv_color_white(), 0);
+            lv_label_set_text(r_label, round_labels[i]);
+            lv_obj_center(r_label);
+        }
+    }
+
+    lv_obj_t *round_close = lv_btn_create(calc_round_overlay);
+    lv_obj_set_size(round_close, 70, 70);
+    lv_obj_set_style_radius(round_close, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(round_close, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_set_style_shadow_width(round_close, 0, 0);
+    lv_obj_set_style_outline_width(round_close, 0, 0);
+    lv_obj_align(round_close, LV_ALIGN_CENTER, 0, 110);
+    lv_obj_add_event_cb(round_close, calc_round_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *round_close_glyph = lv_label_create(round_close);
+    lv_obj_set_style_text_font(round_close_glyph, &lv_font_montserrat_48, 0);
+    lv_label_set_text(round_close_glyph, LV_SYMBOL_CLOSE);
+    lv_obj_center(round_close_glyph);
+
+    /* --- "..." overlay: everything secondary (spec 12/21) - ABS, +/-,
+     * clear, mm/in, history, manual entry, memory. Laid out with the same
+     * flex-wrap grid trick as the app launcher, so it doesn't need manual
+     * per-button coordinates. --- */
+    calc_more_overlay = lv_obj_create(scr_calc);
+    lv_obj_remove_style_all(calc_more_overlay);
+    lv_obj_set_size(calc_more_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_center(calc_more_overlay);
+    lv_obj_set_style_bg_color(calc_more_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(calc_more_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(calc_more_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(calc_more_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *more_title = lv_label_create(calc_more_overlay);
+    lv_obj_set_style_text_font(more_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(more_title, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    lv_label_set_text(more_title, "FONCTIONS");
+    lv_obj_align(more_title, LV_ALIGN_CENTER, 0, -185);
+
+    lv_obj_t *more_grid = lv_obj_create(calc_more_overlay);
+    lv_obj_remove_style_all(more_grid);
+    lv_obj_set_style_bg_opa(more_grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(more_grid, CALC_MORE_COLS * CALC_MORE_BTN_SIZE + (CALC_MORE_COLS - 1) * CALC_MORE_BTN_GAP, LV_SIZE_CONTENT);
+    lv_obj_align(more_grid, LV_ALIGN_CENTER, 0, 15);
+    lv_obj_clear_flag(more_grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_row(more_grid, CALC_MORE_BTN_GAP, 0);
+    lv_obj_set_style_pad_column(more_grid, CALC_MORE_BTN_GAP, 0);
+    lv_obj_set_flex_flow(more_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(more_grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+    {
+        const char *more_labels[11] = {"ABS", "+/-", "C", "MM", "HIST", "123", "M+", "M-", "MR", "OP-X", NULL};
+        const calc_more_id_t more_ids[11] = {
+            CALC_MORE_ABS,    CALC_MORE_NEGATE, CALC_MORE_CLEAR,   CALC_MORE_UNIT,      CALC_MORE_HISTORY, CALC_MORE_KEYPAD,
+            CALC_MORE_MPLUS,  CALC_MORE_MMINUS, CALC_MORE_MRECALL, CALC_MORE_CANCEL_OP, CALC_MORE_CLOSE,
+        };
+
+        for (int i = 0; i < 11; i++)
+        {
+            lv_obj_t *btn_m = lv_btn_create(more_grid);
+            lv_obj_set_size(btn_m, CALC_MORE_BTN_SIZE, CALC_MORE_BTN_SIZE);
+            lv_obj_set_style_shadow_width(btn_m, 0, 0);
+            lv_obj_set_style_outline_width(btn_m, 0, 0);
+
+            bool is_close = (more_ids[i] == CALC_MORE_CLOSE);
+            bool is_clear = (more_ids[i] == CALC_MORE_CLEAR);
+            lv_obj_set_style_radius(btn_m, is_close ? (lv_coord_t)LV_RADIUS_CIRCLE : 16, 0);
+            lv_obj_set_style_bg_color(btn_m,
+                                       is_close ? lv_palette_main(LV_PALETTE_RED)
+                                       : is_clear ? lv_palette_darken(LV_PALETTE_RED, 2)
+                                                  : lv_palette_darken(LV_PALETTE_GREY, 3),
+                                       0);
+            lv_obj_add_event_cb(btn_m, calc_more_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)more_ids[i]);
+            if (more_ids[i] == CALC_MORE_MRECALL)
+            {
+                lv_obj_add_event_cb(btn_m, calc_mr_long_press_cb, LV_EVENT_LONG_PRESSED, NULL);
+            }
+
+            lv_obj_t *m_label = lv_label_create(btn_m);
+            if (is_close)
+            {
+                lv_obj_set_style_text_font(m_label, &lv_font_montserrat_48, 0);
+                lv_label_set_text(m_label, LV_SYMBOL_CLOSE);
+            }
+            else
+            {
+                lv_obj_set_style_text_font(m_label, &lv_font_montserrat_14, 0);
+                lv_label_set_text(m_label, more_labels[i]);
+                if (more_ids[i] == CALC_MORE_UNIT)
+                {
+                    calc_unit_btn_label = m_label; /* kept up to date by calc_more_btn_cb */
+                }
+            }
+            lv_obj_set_style_text_color(m_label, lv_color_white(), 0);
+            lv_obj_center(m_label);
+        }
+    }
+
+    /* --- manual numeric entry overlay (spec 9): only ever shown on
+     * demand, from the "..." menu - the main screen stays keypad-free
+     * (spec 21), which reads much better on a small round display. --- */
+    calc_keypad_overlay = lv_obj_create(scr_calc);
+    lv_obj_remove_style_all(calc_keypad_overlay);
+    lv_obj_set_size(calc_keypad_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_center(calc_keypad_overlay);
+    lv_obj_set_style_bg_color(calc_keypad_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(calc_keypad_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(calc_keypad_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(calc_keypad_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    calc_keypad_preview_label = lv_label_create(calc_keypad_overlay);
+    lv_obj_set_style_text_font(calc_keypad_preview_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(calc_keypad_preview_label, lv_color_white(), 0);
+    lv_label_set_text(calc_keypad_preview_label, "0");
+    lv_obj_align(calc_keypad_preview_label, LV_ALIGN_CENTER, 0, -175);
+
+    lv_obj_t *key_grid = lv_obj_create(calc_keypad_overlay);
+    lv_obj_remove_style_all(key_grid);
+    lv_obj_set_style_bg_opa(key_grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(key_grid, CALC_KEY_COLS * CALC_KEY_BTN_SIZE + (CALC_KEY_COLS - 1) * CALC_KEY_BTN_GAP, LV_SIZE_CONTENT);
+    lv_obj_align(key_grid, LV_ALIGN_CENTER, 0, 15);
+    lv_obj_clear_flag(key_grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_row(key_grid, CALC_KEY_BTN_GAP, 0);
+    lv_obj_set_style_pad_column(key_grid, CALC_KEY_BTN_GAP, 0);
+    lv_obj_set_flex_flow(key_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(key_grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+
+    {
+        static const char CALC_KEYPAD_CHARS[12] = {'7', '8', '9', '4', '5', '6', '1', '2', '3', '.', '0', '\b'};
+
+        for (int i = 0; i < 12; i++)
+        {
+            char ch = CALC_KEYPAD_CHARS[i];
+            lv_obj_t *btn_k = lv_btn_create(key_grid);
+            lv_obj_set_size(btn_k, CALC_KEY_BTN_SIZE, CALC_KEY_BTN_SIZE);
+            lv_obj_set_style_radius(btn_k, 14, 0);
+            lv_obj_set_style_bg_color(btn_k, lv_palette_darken(LV_PALETTE_GREY, 3), 0);
+            lv_obj_set_style_shadow_width(btn_k, 0, 0);
+            lv_obj_set_style_outline_width(btn_k, 0, 0);
+            lv_obj_add_event_cb(btn_k, calc_keypad_key_cb, LV_EVENT_CLICKED, (void *)(intptr_t)ch);
+
+            lv_obj_t *k_label = lv_label_create(btn_k);
+            lv_obj_set_style_text_color(k_label, lv_color_white(), 0);
+            if (ch == '\b')
+            {
+                lv_obj_set_style_text_font(k_label, &lv_font_montserrat_14, 0);
+                lv_label_set_text(k_label, LV_SYMBOL_BACKSPACE);
+            }
+            else
+            {
+                char one_char[2] = {ch, '\0'};
+                lv_obj_set_style_text_font(k_label, &lv_font_montserrat_14, 0);
+                lv_label_set_text(k_label, one_char);
+            }
+            lv_obj_center(k_label);
+        }
+    }
+
+    {
+        lv_obj_t *key_cancel = lv_btn_create(calc_keypad_overlay);
+        lv_obj_set_size(key_cancel, 80, 80);
+        lv_obj_set_style_radius(key_cancel, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(key_cancel, lv_palette_main(LV_PALETTE_RED), 0);
+        lv_obj_set_style_shadow_width(key_cancel, 0, 0);
+        lv_obj_set_style_outline_width(key_cancel, 0, 0);
+        lv_obj_align(key_cancel, LV_ALIGN_CENTER, -50, 195);
+        lv_obj_add_event_cb(key_cancel, calc_keypad_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *key_cancel_glyph = lv_label_create(key_cancel);
+        lv_obj_set_style_text_font(key_cancel_glyph, &lv_font_montserrat_48, 0);
+        lv_label_set_text(key_cancel_glyph, LV_SYMBOL_CLOSE);
+        lv_obj_center(key_cancel_glyph);
+
+        lv_obj_t *key_ok = lv_btn_create(calc_keypad_overlay);
+        lv_obj_set_size(key_ok, 80, 80);
+        lv_obj_set_style_radius(key_ok, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(key_ok, lv_palette_main(LV_PALETTE_GREEN), 0);
+        lv_obj_set_style_shadow_width(key_ok, 0, 0);
+        lv_obj_set_style_outline_width(key_ok, 0, 0);
+        lv_obj_align(key_ok, LV_ALIGN_CENTER, 50, 195);
+        lv_obj_add_event_cb(key_ok, calc_keypad_ok_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *key_ok_glyph = lv_label_create(key_ok);
+        lv_obj_set_style_text_font(key_ok_glyph, &lv_font_montserrat_48, 0);
+        lv_label_set_text(key_ok_glyph, LV_SYMBOL_OK);
+        lv_obj_center(key_ok_glyph);
+    }
+
+    /* --- short history overlay (spec 11): tap a past line to reuse its
+     * result. Rebuilt from scratch every time it's opened (calc_history_open_cb),
+     * so it always reflects calc_state.history as of that moment. --- */
+    calc_history_overlay = lv_obj_create(scr_calc);
+    lv_obj_remove_style_all(calc_history_overlay);
+    lv_obj_set_size(calc_history_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_center(calc_history_overlay);
+    lv_obj_set_style_bg_color(calc_history_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(calc_history_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(calc_history_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(calc_history_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *hist_title = lv_label_create(calc_history_overlay);
+    lv_obj_set_style_text_font(hist_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hist_title, lv_palette_lighten(LV_PALETTE_GREY, 2), 0);
+    lv_label_set_text(hist_title, "HISTORIQUE");
+    lv_obj_align(hist_title, LV_ALIGN_CENTER, 0, -185);
+
+    calc_history_list = lv_obj_create(calc_history_overlay);
+    lv_obj_remove_style_all(calc_history_list);
+    lv_obj_set_style_bg_opa(calc_history_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_size(calc_history_list, 320, 300);
+    lv_obj_align(calc_history_list, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_flex_flow(calc_history_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(calc_history_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(calc_history_list, 10, 0);
+    lv_obj_set_scroll_dir(calc_history_list, LV_DIR_VER);
+
+    lv_obj_t *hist_close = lv_btn_create(calc_history_overlay);
+    lv_obj_set_size(hist_close, 70, 70);
+    lv_obj_set_style_radius(hist_close, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(hist_close, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_obj_set_style_shadow_width(hist_close, 0, 0);
+    lv_obj_set_style_outline_width(hist_close, 0, 0);
+    lv_obj_align(hist_close, LV_ALIGN_CENTER, 0, 195);
+    lv_obj_add_event_cb(hist_close, calc_history_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *hist_close_glyph = lv_label_create(hist_close);
+    lv_obj_set_style_text_font(hist_close_glyph, &lv_font_montserrat_48, 0);
+    lv_label_set_text(hist_close_glyph, LV_SYMBOL_CLOSE);
+    lv_obj_center(hist_close_glyph);
 }

@@ -81,6 +81,7 @@ static const co5300_lcd_init_cmd_t lcd_init_cmds[] = {
 extern lv_obj_t *btn;
 extern void lvgl_demo_ui(lv_disp_t *disp);
 extern void btn_cb(lv_event_t *e);
+extern void usinage_encoder_tick(int32_t diff); /* +1/-1 per detent, rounds the captured value */
 void encoderinit(void)
 {
     ESP_LOGI(TAG, "安装PCNT单元");
@@ -225,6 +226,10 @@ void encoder_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
         // 编码器顺时针旋转
         data->enc_diff = 1;
         ESP_LOGI(TAG, "脉冲计数: %d", pulse_count);
+    }
+    if (data->enc_diff != 0)
+    {
+        usinage_encoder_tick(data->enc_diff);
     }
     last_encoded = encoded;
     // 检测编码器按钮状态
@@ -459,6 +464,7 @@ static void lvgl_port_task(void *arg)
     indev_drv.disp = disp;
     indev_drv.user_data = tp;
     indev_drv.read_cb = touch_driver_read; /*回调函数.*/
+    indev_drv.long_press_time = 600;       /* 长按阈值（毫秒）：用于 Usinage 应用的"主按钮" */
     /*在LVGL中注册驱动程序并保存创建的输入设备对象*/
     lv_indev_drv_register(&indev_drv);
     /*在LVGL中注册编码器*/
